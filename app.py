@@ -3,6 +3,7 @@ import polars as pl
 from openpyxl import load_workbook
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
+import time
 
 # =============================
 # CONFIG UI
@@ -175,6 +176,8 @@ if uploaded_files:
 
     if st.button("🚀 Xử lý dữ liệu"):
 
+        start_time = time.perf_counter()   # bắt đầu đo thời gian
+
         with st.spinner("Đang xử lý..."):
 
             data_date = read_excel_files(uploaded_files)
@@ -196,7 +199,11 @@ if uploaded_files:
 
             st.session_state.output_excel = output.getvalue()
 
-            st.success("✅ Hoàn thành!")
+        end_time = time.perf_counter()   # kết thúc đo
+        elapsed = end_time - start_time
+
+        st.info(f"⏱️ Thời gian xử lý: {elapsed:.2f} giây")
+        st.success("✅ Hoàn thành!")
 
 
 # =============================
