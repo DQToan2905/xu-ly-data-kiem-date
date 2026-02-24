@@ -1,0 +1,5 @@
+streamlit
+polars
+openpyxl
+xlsxwriter
+fastexcel
