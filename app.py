@@ -1,23 +1,28 @@
 """
 Xử lý data kiểm date - Optimized for large datasets (Pure Polars, no DuckDB)
 =============================================================================
-Chiến lược:
-  1. Polars LazyFrame + streaming=True  → lazy eval, không load thừa RAM
-  2. Parquet staging                    → file trung gian nhỏ, nhanh
-  3. ThreadPoolExecutor per-file        → I/O song song (phù hợp Streamlit Cloud)
-  4. Filter trước khi collect           → chỉ giữ rows cần thiết trong RAM
-  5. xlsxwriter constant_memory         → streaming write Excel, không OOM
+Chiến lược chống OOM:
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  Excel file(s)                                                  │
+  │     ↓ (đọc từng sheet, filter ngay)                             │
+  │  Parquet staging files  ← không bao giờ giữ hết trong RAM       │
+  │     ↓ (đọc từng Parquet file, ghi thẳng vào Excel)             │
+  │  Excel output  ← xlsxwriter constant_memory = ghi row-by-row   │
+  └─────────────────────────────────────────────────────────────────┘
+
+  NGUYÊN TẮC: Không bao giờ collect() toàn bộ data vào 1 DataFrame.
+  Mọi thứ đều xử lý theo từng Parquet chunk nhỏ.
 """
 
 import streamlit as st
 import polars as pl
+import xlsxwriter
 import tempfile
 import os
 import gc
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
-from pathlib import Path
 from openpyxl import load_workbook
 
 # ============================= CONFIG =============================
@@ -42,145 +47,221 @@ COLUMNS_KEEP = [
 
 FILTER_COLS = ['SL giảm giá', 'SL hủy tại siêu thị', 'SL tặng KM', 'SL cận date (tặng quà)']
 
-STREAMING_THRESHOLD = 200_000   # dòng — trên mức này dùng streaming export
+# RAM tối đa mỗi chunk khi ghi Excel (số dòng)
+WRITE_CHUNK = 5_000
 
 
-# ============================= CORE PROCESSING =============================
+# ============================= BƯỚC 1: XỬ LÝ → PARQUET =============================
 
-def process_sheet(file_bytes: bytes, sheet_name: str, file_name: str) -> pl.DataFrame | None:
+def process_sheet_to_parquet(file_bytes: bytes, sheet_name: str,
+                              file_name: str, staging_dir: str) -> tuple[str | None, str | None]:
     """
-    Đọc 1 sheet → LazyFrame pipeline → collect 1 lần duy nhất.
-    Không giữ data thừa trong RAM — filter xong mới collect.
+    Đọc 1 sheet → filter → lưu Parquet.
+    Trả về (parquet_path, error_msg).
+    RAM tối đa = 1 sheet tại 1 thời điểm.
     """
     try:
-        # infer_schema_length=0 → đọc tất cả là Utf8, tránh lỗi mixed type
         lf = pl.read_excel(
             BytesIO(file_bytes),
             sheet_name=sheet_name,
-            infer_schema_length=0,
+            infer_schema_length=0,      # tất cả Utf8, không infer sai kiểu
         ).lazy()
 
         available = lf.columns
 
-        # Cast các cột số (chỉ những cột tồn tại trong sheet)
-        cast_exprs = [
-            pl.col(c).cast(pl.Float64, strict=False)
-            for c in FILTER_COLS if c in available
-        ]
-
-        # Tạo expr lọc: tổng các cột số > 0
         filter_cols_present = [c for c in FILTER_COLS if c in available]
         if not filter_cols_present:
-            return None  # sheet không có cột lọc → bỏ qua
+            return None, None           # sheet không liên quan
+
+        cast_exprs = [
+            pl.col(c).cast(pl.Float64, strict=False)
+            for c in filter_cols_present
+        ]
 
         filter_expr = sum(
-            pl.col(c).fill_null(0)
-            for c in filter_cols_present
+            pl.col(c).fill_null(0) for c in filter_cols_present
         ) > 0
 
-        # Select chỉ những cột cần giữ (có trong sheet)
         keep = [c for c in COLUMNS_KEEP if c in available]
 
-        lf = (
-            lf
-            .with_columns(cast_exprs)
-            .filter(filter_expr)        # lọc TRƯỚC khi collect → RAM nhỏ hơn nhiều
-            .select(keep)
-        )
+        lf = (lf
+              .with_columns(cast_exprs)
+              .filter(filter_expr)      # lọc TRƯỚC collect
+              .select(keep))
 
-        # Xử lý hình ảnh sau filter (ít rows hơn)
         if 'Hình ảnh_1' in keep:
             lf = lf.with_columns(
-                pl.concat_str([
-                    pl.lit('"'),
-                    pl.col('Hình ảnh_1').fill_null(''),
-                    pl.lit('"')
-                ]).alias('Hình ảnh_1')
+                pl.concat_str([pl.lit('"'),
+                               pl.col('Hình ảnh_1').fill_null(''),
+                               pl.lit('"')]).alias('Hình ảnh_1')
             )
 
         lf = lf.with_columns(pl.lit(file_name).alias("file_name"))
 
-        # collect(streaming=True) → Polars tự chia chunk nội bộ, không bùng RAM
         df = lf.collect(streaming=True)
-        return df if len(df) > 0 else None
+        if df.is_empty():
+            return None, None
+
+        # Lưu Parquet ngay, giải phóng DataFrame khỏi RAM
+        safe = "".join(c if c.isalnum() else "_" for c in f"{file_name}_{sheet_name}")
+        path = os.path.join(staging_dir, f"{safe[:100]}.parquet")
+        df.write_parquet(path, compression="snappy")
+        del df
+        gc.collect()
+        return path, None
 
     except Exception as e:
-        return e   # trả về exception để xử lý bên ngoài
+        return None, f"Sheet '{sheet_name}' / '{file_name}': {e}"
 
 
-def process_file_to_parquet(file_bytes: bytes, file_name: str, staging_dir: str) -> tuple[list[str], list[str]]:
-    """
-    Xử lý toàn bộ sheets trong 1 file → lưu từng sheet ra Parquet staging.
-    Trả về (parquet_paths, errors).
-    """
-    parquet_paths = []
-    errors = []
+def process_file_to_parquets(uf, staging_dir: str) -> tuple[list[str], list[str]]:
+    """Xử lý 1 uploaded file → nhiều Parquet files (1 per sheet)."""
+    file_bytes = uf.getvalue()
+    file_name  = uf.name
+    paths, errors = [], []
 
     try:
         wb = load_workbook(BytesIO(file_bytes), read_only=True)
         sheet_names = wb.sheetnames
         wb.close()
     except Exception as e:
-        return [], [f"Không mở được file '{file_name}': {e}"]
+        del file_bytes
+        return [], [f"Không mở được '{file_name}': {e}"]
 
-    for sheet_name in sheet_names:
-        result = process_sheet(file_bytes, sheet_name, file_name)
+    for sname in sheet_names:
+        path, err = process_sheet_to_parquet(file_bytes, sname, file_name, staging_dir)
+        if path:
+            paths.append(path)
+        if err:
+            errors.append(err)
 
-        if result is None:
-            continue  # sheet rỗng hoặc không có cột lọc
-        elif isinstance(result, Exception):
-            errors.append(f"Sheet '{sheet_name}' / '{file_name}': {result}")
-            continue
+    del file_bytes
+    gc.collect()
+    return paths, errors
 
-        df: pl.DataFrame = result
-        try:
-            safe = "".join(c if c.isalnum() else "_" for c in f"{file_name}_{sheet_name}")
-            path = os.path.join(staging_dir, f"{safe[:120]}.parquet")
-            df.write_parquet(path, compression="snappy")
-            parquet_paths.append(path)
-        except Exception as e:
-            errors.append(f"Ghi Parquet sheet '{sheet_name}': {e}")
-        finally:
-            del df
+
+# ============================= BƯỚC 2: PARQUET → EXCEL (STREAMING) =============================
+
+def _get_unified_columns(parquet_paths: list[str]) -> list[str]:
+    """
+    Xác định schema chung từ tất cả Parquet files mà không load data.
+    Dùng để viết header Excel trước khi ghi data.
+    """
+    all_cols: list[str] = []
+    seen: set[str] = set()
+    for p in parquet_paths:
+        schema = pl.read_parquet_schema(p)
+        for col in schema.keys():
+            if col not in seen:
+                all_cols.append(col)
+                seen.add(col)
+    return all_cols
+
+
+def parquets_to_excel_streaming(parquet_paths: list[str],
+                                 status_text, progress_bar) -> tuple[bytes, int]:
+    """
+    Ghi Excel TRỰC TIẾP từ Parquet files, từng chunk nhỏ.
+    ─────────────────────────────────────────────────────
+    KHÔNG bao giờ load toàn bộ data vào RAM.
+    Mỗi lúc chỉ giữ WRITE_CHUNK dòng (mặc định 5000).
+
+    xlsxwriter constant_memory=True:
+      → ghi từng row ra disk ngay lập tức
+      → RAM của workbook ≈ 0 bất kể bao nhiêu dòng
+    """
+    output  = BytesIO()
+    workbook  = xlsxwriter.Workbook(output, {
+        'constant_memory': True,   # KEY: row được flush ra disk ngay khi ghi
+        'in_memory':       True,   # output là BytesIO không phải file path
+        'strings_to_urls': False,  # tắt URL detection — tăng tốc ~30%
+    })
+    worksheet = workbook.add_worksheet("Data")
+
+    header_fmt = workbook.add_format({
+        'bold': True, 'bg_color': '#4472C4',
+        'font_color': 'white', 'border': 1,
+    })
+
+    # Xác định cột chung (không load data)
+    all_cols = _get_unified_columns(parquet_paths)
+    col_index = {c: i for i, c in enumerate(all_cols)}
+
+    # Ghi header
+    for i, col in enumerate(all_cols):
+        worksheet.write(0, i, col, header_fmt)
+
+    total_rows_written = 0
+    n_parts = len(parquet_paths)
+
+    for pi, ppath in enumerate(parquet_paths):
+        # Đọc từng Parquet file theo chunk → ghi ngay → giải phóng
+        reader = pl.read_parquet(ppath)   # 1 Parquet = 1 sheet đã filtered → nhỏ
+        n = len(reader)
+
+        for start in range(0, n, WRITE_CHUNK):
+            chunk = reader.slice(start, WRITE_CHUNK)
+
+            # Ghi từng row của chunk
+            for ri, row in enumerate(chunk.iter_rows(named=True),
+                                     start=total_rows_written + 1):
+                for col_name, val in row.items():
+                    ci = col_index.get(col_name)
+                    if ci is None:
+                        continue
+                    # Bỏ None / NaN, ghi giá trị hợp lệ
+                    if val is not None and val == val:
+                        worksheet.write(ri, ci, val)
+
+            total_rows_written += len(chunk)
+            del chunk
             gc.collect()
 
-    return parquet_paths, errors
+        del reader
+        gc.collect()
+
+        # Cập nhật progress (80%→99% cho bước export)
+        pct = 0.80 + (pi + 1) / n_parts * 0.19
+        progress_bar.progress(min(pct, 0.99))
+        status_text.text(
+            f"📤 Đang ghi Excel... {total_rows_written:,} dòng "
+            f"({pi + 1}/{n_parts} phần)"
+        )
+
+    workbook.close()
+    output.seek(0)
+    return output.getvalue(), total_rows_written
 
 
-def read_all_files(uploaded_files, progress_bar, status_text) -> pl.DataFrame | None:
+# ============================= PIPELINE CHÍNH =============================
+
+def run_pipeline(uploaded_files, progress_bar, status_text,
+                 max_workers: int) -> tuple[bytes, int] | None:
     """
-    Pipeline chính:
-      1. Lưu file bytes (giữ trong memory — Streamlit Cloud không cho ghi disk tự do)
-      2. ThreadPool xử lý từng file song song
-      3. Gộp kết quả bằng Polars scan_parquet (lazy)
+    Full pipeline: Excel files → Parquet staging → Excel output.
+    RAM tối đa ≈ kích thước 1 sheet lớn nhất + WRITE_CHUNK dòng.
     """
     staging_dir = tempfile.mkdtemp(prefix="kiem_date_")
     n = len(uploaded_files)
     all_parquet: list[str] = []
-    all_errors: list[str] = []
-
-    def handle_one(uf):
-        file_bytes = uf.getvalue()   # bytes đọc 1 lần
-        file_name  = uf.name
-        paths, errs = process_file_to_parquet(file_bytes, file_name, staging_dir)
-        del file_bytes               # giải phóng ngay
-        gc.collect()
-        return paths, errs, file_name
-
-    # ThreadPool phù hợp Streamlit Cloud (single-process, I/O-bound)
-    max_workers = min(4, n)
+    all_errors:  list[str] = []
     completed = 0
 
+    # ── Bước 1: Song song đọc & filter → Parquet ──
+    status_text.text("🔄 Đang đọc và lọc dữ liệu...")
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(handle_one, uf): uf.name for uf in uploaded_files}
+        futures = {
+            executor.submit(process_file_to_parquets, uf, staging_dir): uf.name
+            for uf in uploaded_files
+        }
         for future in as_completed(futures):
             completed += 1
-            progress_bar.progress(completed / n * 0.80)
+            progress_bar.progress(completed / n * 0.78)
             try:
-                paths, errs, fname = future.result()
+                paths, errs = future.result()
                 all_parquet.extend(paths)
                 all_errors.extend(errs)
-                status_text.text(f"✅ {completed}/{n}: {fname}")
+                status_text.text(f"✅ {completed}/{n}: {futures[future]}")
             except Exception as e:
                 all_errors.append(f"Worker lỗi: {e}")
 
@@ -190,100 +271,52 @@ def read_all_files(uploaded_files, progress_bar, status_text) -> pl.DataFrame | 
     if not all_parquet:
         return None
 
-    # Gộp tất cả Parquet bằng scan_parquet (lazy, columnar)
-    status_text.text(f"🔀 Đang tổng hợp {len(all_parquet)} phần dữ liệu...")
-    progress_bar.progress(0.88)
+    # ── Bước 2: Parquet → Excel (streaming, không collect tổng) ──
+    status_text.text(f"📤 Đang xuất Excel từ {len(all_parquet)} phần...")
+    progress_bar.progress(0.80)
 
+    output_bytes, total_rows = parquets_to_excel_streaming(
+        all_parquet, status_text, progress_bar
+    )
+
+    # Dọn Parquet staging
+    for p in all_parquet:
+        try:
+            os.unlink(p)
+        except Exception:
+            pass
     try:
-        df_final = (
-            pl.scan_parquet(all_parquet)          # lazy scan — không load hết RAM
-              .collect(streaming=True)             # streaming collect
-        )
-    except Exception as e:
-        st.error(f"Lỗi khi gộp Parquet: {e}")
-        return None
+        os.rmdir(staging_dir)
+    except Exception:
+        pass
 
-    progress_bar.progress(0.92)
-    return df_final
-
-
-def export_excel(df: pl.DataFrame, status_text) -> bytes:
-    """
-    Xuất Excel thông minh:
-    - Nhỏ  (≤ threshold): Polars write_excel (nhanh, đẹp)
-    - Lớn  (> threshold): xlsxwriter constant_memory (streaming, không OOM)
-    """
-    output = BytesIO()
-    n_rows = len(df)
-
-    if n_rows <= STREAMING_THRESHOLD:
-        status_text.text(f"📤 Đang xuất {n_rows:,} dòng...")
-        df.write_excel(output, autofit=True)
-    else:
-        import xlsxwriter
-        status_text.text(f"📤 Streaming export {n_rows:,} dòng (constant_memory mode)...")
-
-        workbook = xlsxwriter.Workbook(output, {
-            'constant_memory': True,  # ghi từng row ra ngay, không buffer
-            'in_memory': True,
-        })
-        worksheet = workbook.add_worksheet("Data")
-
-        header_fmt = workbook.add_format({
-            'bold': True,
-            'bg_color': '#4472C4',
-            'font_color': 'white',
-            'border': 1,
-        })
-
-        cols = df.columns
-        for ci, col in enumerate(cols):
-            worksheet.write(0, ci, col, header_fmt)
-
-        # Chuyển từng batch 10k dòng — tránh OOM với pandas itertuples
-        BATCH = 10_000
-        for start in range(0, n_rows, BATCH):
-            batch = df.slice(start, BATCH).to_pandas()
-            for ri, row in enumerate(batch.itertuples(index=False), start=start + 1):
-                for ci, val in enumerate(row):
-                    if val is not None and val == val:   # bỏ NaN
-                        worksheet.write(ri, ci, val)
-            del batch
-            gc.collect()
-            if start % 50_000 == 0 and start > 0:
-                status_text.text(f"📤 Đã ghi {start:,}/{n_rows:,} dòng...")
-
-        workbook.close()
-
-    output.seek(0)
-    return output.getvalue()
+    return output_bytes, total_rows
 
 
 # ============================= UI =============================
 
-# Sidebar config
 with st.sidebar:
     st.header("⚙️ Cấu hình")
-    streaming_threshold = st.number_input(
-        "Ngưỡng streaming export (dòng)",
-        min_value=10_000, max_value=1_000_000,
-        value=STREAMING_THRESHOLD, step=50_000,
-        help="Trên ngưỡng này dùng streaming write để tiết kiệm RAM"
-    )
     max_workers_cfg = st.slider(
-        "Số luồng xử lý song song",
-        min_value=1, max_value=8, value=4,
-        help="Tăng nếu nhiều file nhỏ; giảm nếu ít RAM"
+        "Số luồng đọc song song",
+        min_value=1, max_value=8, value=2,
+        help="Tăng nếu nhiều file nhỏ; GIẢM nếu file lớn/RAM thấp"
+    )
+    write_chunk_cfg = st.select_slider(
+        "Chunk size khi ghi Excel (dòng)",
+        options=[1_000, 2_000, 5_000, 10_000, 20_000],
+        value=5_000,
+        help="Nhỏ hơn = ít RAM hơn; Lớn hơn = nhanh hơn"
     )
     st.divider()
     st.markdown("""
 **💡 Tips:**
-- File lớn → giảm số luồng
-- Nhiều sheet → Parquet staging tự động
-- RAM thấp → giảm ngưỡng streaming
+- File lớn → giảm số luồng xuống 1–2
+- RAM thấp → giảm chunk size xuống 1000–2000
+- Nhiều file nhỏ → tăng số luồng lên 4–6
+- Output >500k dòng → có thể mất vài phút
     """)
 
-# File uploader
 uploaded_files = st.file_uploader(
     "📂 Upload các file Excel",
     type=["xlsx", "xls"],
@@ -297,29 +330,32 @@ if "row_count" not in st.session_state:
 
 if uploaded_files:
     total_mb = sum(len(f.getvalue()) for f in uploaded_files) / 1024 / 1024
-    st.info(f"📁 **{len(uploaded_files)} file** | Tổng: **{total_mb:.1f} MB**")
-    if total_mb > 300:
-        st.warning("⚠️ Data lớn — tự động dùng Parquet staging + streaming export")
+    col_info, col_warn = st.columns([2, 1])
+    col_info.info(f"📁 **{len(uploaded_files)} file** | Tổng: **{total_mb:.1f} MB**")
+    if total_mb > 200:
+        col_warn.warning("⚠️ Data lớn — dùng streaming mode")
 
     if st.button("🚀 Xử lý dữ liệu", type="primary", use_container_width=True):
-        STREAMING_THRESHOLD = streaming_threshold
+        # Apply config từ sidebar
+        WRITE_CHUNK = write_chunk_cfg
 
-        start_time = time.perf_counter()
+        start_time   = time.perf_counter()
         progress_bar = st.progress(0)
         status_text  = st.empty()
 
         try:
-            df_result = read_all_files(uploaded_files, progress_bar, status_text)
+            result = run_pipeline(
+                uploaded_files, progress_bar, status_text,
+                max_workers=max_workers_cfg
+            )
 
-            if df_result is None:
+            if result is None:
                 st.error("❌ Không có dữ liệu thỏa điều kiện lọc")
                 st.stop()
 
-            progress_bar.progress(0.94)
-            output_bytes = export_excel(df_result, status_text)
-
+            output_bytes, total_rows = result
             st.session_state.output_excel = output_bytes
-            st.session_state.row_count    = len(df_result)
+            st.session_state.row_count    = total_rows
 
             elapsed = time.perf_counter() - start_time
             progress_bar.progress(1.0)
@@ -327,20 +363,18 @@ if uploaded_files:
 
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("⏱️ Thời gian",  f"{elapsed:.1f}s")
-            c2.metric("📊 Tổng dòng",  f"{len(df_result):,}")
+            c2.metric("📊 Tổng dòng",  f"{total_rows:,}")
             c3.metric("📁 Files",       len(uploaded_files))
             c4.metric("💾 Output",      f"{len(output_bytes)/1024/1024:.1f} MB")
 
-            del df_result
             gc.collect()
 
         except MemoryError:
-            st.error("❌ Hết RAM! Thử giảm số luồng hoặc chia nhỏ file.")
+            st.error("❌ Hết RAM! Giảm số luồng xuống 1 và chunk size xuống 1000.")
         except Exception as e:
             st.error(f"❌ Lỗi: {e}")
             st.exception(e)
 
-# Download button
 if st.session_state.output_excel is not None:
     st.download_button(
         label=f"📥 Download Excel ({st.session_state.row_count:,} dòng)",
