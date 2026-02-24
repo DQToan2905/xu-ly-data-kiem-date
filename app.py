@@ -140,18 +140,60 @@ def process_file_to_parquets(uf, staging_dir: str) -> tuple[list[str], list[str]
     return paths, errors
 
 
-# ============================= BƯỚC 2: PARQUET → EXCEL (STREAMING) =============================
+# ============================= BƯỚC 2A: PARQUET → CSV (STREAMING) =============================
+
+def parquets_to_csv_streaming(parquet_paths: list[str],
+                               status_text, progress_bar) -> tuple[bytes, int]:
+    """
+    Ghi CSV trực tiếp từ Parquet — NHANH NHẤT, RAM thấp nhất.
+    ──────────────────────────────────────────────────────────
+    CSV là plain text → không cần buffer, không cần format.
+    Polars write_csv() với BytesIO là zero-copy cho từng chunk.
+    Encoding UTF-8 with BOM → Excel mở đúng tiếng Việt ngay.
+    """
+    output = BytesIO()
+    total_rows = 0
+    n_parts = len(parquet_paths)
+    header_written = False
+
+    # UTF-8 BOM — Excel tự nhận diện encoding tiếng Việt
+    output.write(b'\xef\xbb\xbf')
+
+    for pi, ppath in enumerate(parquet_paths):
+        df = pl.read_parquet(ppath)
+        n  = len(df)
+
+        for start in range(0, n, WRITE_CHUNK):
+            chunk = df.slice(start, WRITE_CHUNK)
+            # has_header=False sau lần đầu → không lặp lại header
+            csv_bytes = chunk.write_csv(has_header=not header_written).encode('utf-8')
+            # Bỏ BOM ký tự đầu nếu polars tự thêm
+            if csv_bytes.startswith(b'\xef\xbb\xbf'):
+                csv_bytes = csv_bytes[3:]
+            output.write(csv_bytes)
+            header_written = True
+            total_rows += len(chunk)
+            del chunk
+
+        del df
+        gc.collect()
+
+        pct = 0.80 + (pi + 1) / n_parts * 0.19
+        progress_bar.progress(min(pct, 0.99))
+        status_text.text(f"📤 Đang ghi CSV... {total_rows:,} dòng ({pi+1}/{n_parts} phần)")
+
+    output.seek(0)
+    return output.getvalue(), total_rows
+
+
+# ============================= BƯỚC 2B: PARQUET → EXCEL (STREAMING) =============================
 
 def _get_unified_columns(parquet_paths: list[str]) -> list[str]:
-    """
-    Xác định schema chung từ tất cả Parquet files mà không load data.
-    Dùng để viết header Excel trước khi ghi data.
-    """
+    """Schema chung từ tất cả Parquet — không load data."""
     all_cols: list[str] = []
     seen: set[str] = set()
     for p in parquet_paths:
-        schema = pl.read_parquet_schema(p)
-        for col in schema.keys():
+        for col in pl.read_parquet_schema(p).keys():
             if col not in seen:
                 all_cols.append(col)
                 seen.add(col)
@@ -161,88 +203,67 @@ def _get_unified_columns(parquet_paths: list[str]) -> list[str]:
 def parquets_to_excel_streaming(parquet_paths: list[str],
                                  status_text, progress_bar) -> tuple[bytes, int]:
     """
-    Ghi Excel TRỰC TIẾP từ Parquet files, từng chunk nhỏ.
-    ─────────────────────────────────────────────────────
-    KHÔNG bao giờ load toàn bộ data vào RAM.
-    Mỗi lúc chỉ giữ WRITE_CHUNK dòng (mặc định 5000).
-
-    xlsxwriter constant_memory=True:
-      → ghi từng row ra disk ngay lập tức
-      → RAM của workbook ≈ 0 bất kể bao nhiêu dòng
+    Ghi Excel từ Parquet files, từng chunk WRITE_CHUNK dòng.
+    xlsxwriter constant_memory=True → flush row ngay, RAM ≈ 0.
     """
-    output  = BytesIO()
-    workbook  = xlsxwriter.Workbook(output, {
-        'constant_memory': True,   # KEY: row được flush ra disk ngay khi ghi
-        'in_memory':       True,   # output là BytesIO không phải file path
-        'strings_to_urls': False,  # tắt URL detection — tăng tốc ~30%
+    output   = BytesIO()
+    workbook = xlsxwriter.Workbook(output, {
+        'constant_memory': True,
+        'in_memory':       True,
+        'strings_to_urls': False,
     })
-    worksheet = workbook.add_worksheet("Data")
-
+    worksheet  = workbook.add_worksheet("Data")
     header_fmt = workbook.add_format({
         'bold': True, 'bg_color': '#4472C4',
         'font_color': 'white', 'border': 1,
     })
 
-    # Xác định cột chung (không load data)
-    all_cols = _get_unified_columns(parquet_paths)
+    all_cols  = _get_unified_columns(parquet_paths)
     col_index = {c: i for i, c in enumerate(all_cols)}
 
-    # Ghi header
     for i, col in enumerate(all_cols):
         worksheet.write(0, i, col, header_fmt)
 
-    total_rows_written = 0
-    n_parts = len(parquet_paths)
+    total_rows = 0
+    n_parts    = len(parquet_paths)
 
     for pi, ppath in enumerate(parquet_paths):
-        # Đọc từng Parquet file theo chunk → ghi ngay → giải phóng
-        reader = pl.read_parquet(ppath)   # 1 Parquet = 1 sheet đã filtered → nhỏ
-        n = len(reader)
+        reader = pl.read_parquet(ppath)
+        n      = len(reader)
 
         for start in range(0, n, WRITE_CHUNK):
             chunk = reader.slice(start, WRITE_CHUNK)
-
-            # Ghi từng row của chunk
-            for ri, row in enumerate(chunk.iter_rows(named=True),
-                                     start=total_rows_written + 1):
+            for ri, row in enumerate(chunk.iter_rows(named=True), start=total_rows + 1):
                 for col_name, val in row.items():
                     ci = col_index.get(col_name)
-                    if ci is None:
-                        continue
-                    # Bỏ None / NaN, ghi giá trị hợp lệ
-                    if val is not None and val == val:
+                    if ci is not None and val is not None and val == val:
                         worksheet.write(ri, ci, val)
-
-            total_rows_written += len(chunk)
+            total_rows += len(chunk)
             del chunk
             gc.collect()
 
         del reader
         gc.collect()
 
-        # Cập nhật progress (80%→99% cho bước export)
         pct = 0.80 + (pi + 1) / n_parts * 0.19
         progress_bar.progress(min(pct, 0.99))
-        status_text.text(
-            f"📤 Đang ghi Excel... {total_rows_written:,} dòng "
-            f"({pi + 1}/{n_parts} phần)"
-        )
+        status_text.text(f"📤 Đang ghi Excel... {total_rows:,} dòng ({pi+1}/{n_parts} phần)")
 
     workbook.close()
     output.seek(0)
-    return output.getvalue(), total_rows_written
+    return output.getvalue(), total_rows
 
 
 # ============================= PIPELINE CHÍNH =============================
 
 def run_pipeline(uploaded_files, progress_bar, status_text,
-                 max_workers: int) -> tuple[bytes, int] | None:
+                 max_workers: int, export_format: str) -> tuple[bytes, int, str] | None:
     """
-    Full pipeline: Excel files → Parquet staging → Excel output.
-    RAM tối đa ≈ kích thước 1 sheet lớn nhất + WRITE_CHUNK dòng.
+    Full pipeline: Excel files → Parquet staging → CSV hoặc Excel.
+    Trả về (output_bytes, total_rows, format).
     """
     staging_dir = tempfile.mkdtemp(prefix="kiem_date_")
-    n = len(uploaded_files)
+    n           = len(uploaded_files)
     all_parquet: list[str] = []
     all_errors:  list[str] = []
     completed = 0
@@ -271,50 +292,69 @@ def run_pipeline(uploaded_files, progress_bar, status_text,
     if not all_parquet:
         return None
 
-    # ── Bước 2: Parquet → Excel (streaming, không collect tổng) ──
-    status_text.text(f"📤 Đang xuất Excel từ {len(all_parquet)} phần...")
     progress_bar.progress(0.80)
 
-    output_bytes, total_rows = parquets_to_excel_streaming(
-        all_parquet, status_text, progress_bar
-    )
+    # ── Bước 2: Export theo format đã chọn ──
+    if export_format == "CSV":
+        status_text.text(f"📤 Đang xuất CSV từ {len(all_parquet)} phần...")
+        output_bytes, total_rows = parquets_to_csv_streaming(all_parquet, status_text, progress_bar)
+    else:
+        status_text.text(f"📤 Đang xuất Excel từ {len(all_parquet)} phần...")
+        output_bytes, total_rows = parquets_to_excel_streaming(all_parquet, status_text, progress_bar)
 
     # Dọn Parquet staging
     for p in all_parquet:
-        try:
-            os.unlink(p)
-        except Exception:
-            pass
-    try:
-        os.rmdir(staging_dir)
-    except Exception:
-        pass
+        try: os.unlink(p)
+        except Exception: pass
+    try: os.rmdir(staging_dir)
+    except Exception: pass
 
-    return output_bytes, total_rows
+    return output_bytes, total_rows, export_format
 
 
 # ============================= UI =============================
 
+EXCEL_ROW_LIMIT = 1_048_576   # giới hạn cứng của Excel
+
 with st.sidebar:
     st.header("⚙️ Cấu hình")
+
+    export_fmt = st.radio(
+        "📁 Định dạng xuất",
+        options=["CSV", "Excel (.xlsx)"],
+        index=0,
+        help="CSV nhanh hơn 5–10x, không giới hạn dòng, mở được trong Excel"
+    )
+
+    st.divider()
+
     max_workers_cfg = st.slider(
         "Số luồng đọc song song",
         min_value=1, max_value=8, value=2,
         help="Tăng nếu nhiều file nhỏ; GIẢM nếu file lớn/RAM thấp"
     )
-    write_chunk_cfg = st.select_slider(
-        "Chunk size khi ghi Excel (dòng)",
-        options=[1_000, 2_000, 5_000, 10_000, 20_000],
-        value=5_000,
-        help="Nhỏ hơn = ít RAM hơn; Lớn hơn = nhanh hơn"
-    )
+
+    if export_fmt == "Excel (.xlsx)":
+        write_chunk_cfg = st.select_slider(
+            "Chunk size khi ghi Excel (dòng)",
+            options=[1_000, 2_000, 5_000, 10_000, 20_000],
+            value=5_000,
+            help="Nhỏ hơn = ít RAM hơn; Lớn hơn = nhanh hơn"
+        )
+    else:
+        write_chunk_cfg = 10_000   # CSV không cần nhỏ
+
     st.divider()
     st.markdown("""
-**💡 Tips:**
-- File lớn → giảm số luồng xuống 1–2
-- RAM thấp → giảm chunk size xuống 1000–2000
-- Nhiều file nhỏ → tăng số luồng lên 4–6
-- Output >500k dòng → có thể mất vài phút
+**💡 Khi nào dùng CSV?**
+- Data > 100k dòng
+- Cần tốc độ nhanh
+- Không cần format/màu sắc
+
+**💡 Khi nào dùng Excel?**
+- Data < 100k dòng
+- Cần chia sẻ có format đẹp
+- Người nhận không quen CSV
     """)
 
 uploaded_files = st.file_uploader(
@@ -323,21 +363,26 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
-if "output_excel" not in st.session_state:
-    st.session_state.output_excel = None
-if "row_count" not in st.session_state:
-    st.session_state.row_count = 0
+if "output_data"   not in st.session_state: st.session_state.output_data   = None
+if "output_format" not in st.session_state: st.session_state.output_format = "CSV"
+if "row_count"     not in st.session_state: st.session_state.row_count     = 0
 
 if uploaded_files:
     total_mb = sum(len(f.getvalue()) for f in uploaded_files) / 1024 / 1024
-    col_info, col_warn = st.columns([2, 1])
+
+    # Gợi ý format dựa trên kích thước
+    auto_recommend = "CSV" if total_mb > 50 else "Excel (.xlsx)"
+
+    col_info, col_rec = st.columns([2, 1])
     col_info.info(f"📁 **{len(uploaded_files)} file** | Tổng: **{total_mb:.1f} MB**")
-    if total_mb > 200:
-        col_warn.warning("⚠️ Data lớn — dùng streaming mode")
+    if auto_recommend == "CSV":
+        col_rec.warning(f"💡 Gợi ý: dùng **CSV** cho data lớn")
+    else:
+        col_rec.success(f"✅ Dùng **Excel** ổn với data nhỏ")
 
     if st.button("🚀 Xử lý dữ liệu", type="primary", use_container_width=True):
-        # Apply config từ sidebar
         WRITE_CHUNK = write_chunk_cfg
+        chosen_fmt  = "CSV" if export_fmt == "CSV" else "Excel"
 
         start_time   = time.perf_counter()
         progress_bar = st.progress(0)
@@ -346,16 +391,23 @@ if uploaded_files:
         try:
             result = run_pipeline(
                 uploaded_files, progress_bar, status_text,
-                max_workers=max_workers_cfg
+                max_workers=max_workers_cfg,
+                export_format=chosen_fmt,
             )
 
             if result is None:
                 st.error("❌ Không có dữ liệu thỏa điều kiện lọc")
                 st.stop()
 
-            output_bytes, total_rows = result
-            st.session_state.output_excel = output_bytes
-            st.session_state.row_count    = total_rows
+            output_bytes, total_rows, fmt = result
+
+            # Cảnh báo nếu Excel vượt giới hạn dòng
+            if fmt == "Excel" and total_rows >= EXCEL_ROW_LIMIT:
+                st.error(f"⛔ Excel bị cắt ở {EXCEL_ROW_LIMIT:,} dòng! Hãy dùng CSV.")
+
+            st.session_state.output_data   = output_bytes
+            st.session_state.output_format = fmt
+            st.session_state.row_count     = total_rows
 
             elapsed = time.perf_counter() - start_time
             progress_bar.progress(1.0)
@@ -370,17 +422,30 @@ if uploaded_files:
             gc.collect()
 
         except MemoryError:
-            st.error("❌ Hết RAM! Giảm số luồng xuống 1 và chunk size xuống 1000.")
+            st.error("❌ Hết RAM! Giảm số luồng xuống 1, đổi sang CSV, hoặc chia nhỏ file.")
         except Exception as e:
             st.error(f"❌ Lỗi: {e}")
             st.exception(e)
 
-if st.session_state.output_excel is not None:
-    st.download_button(
-        label=f"📥 Download Excel ({st.session_state.row_count:,} dòng)",
-        data=st.session_state.output_excel,
-        file_name="data_kiem_date.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-        use_container_width=True,
-    )
+# ── Download button — tự điều chỉnh theo format ──
+if st.session_state.output_data is not None:
+    fmt = st.session_state.output_format
+    if fmt == "CSV":
+        st.download_button(
+            label=f"📥 Download CSV ({st.session_state.row_count:,} dòng)",
+            data=st.session_state.output_data,
+            file_name="data_kiem_date.csv",
+            mime="text/csv; charset=utf-8",
+            type="primary",
+            use_container_width=True,
+        )
+        st.caption("💡 Mở trong Excel: Data tab → From Text/CSV → Encoding: UTF-8")
+    else:
+        st.download_button(
+            label=f"📥 Download Excel ({st.session_state.row_count:,} dòng)",
+            data=st.session_state.output_data,
+            file_name="data_kiem_date.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            use_container_width=True,
+        )
