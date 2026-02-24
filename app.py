@@ -166,7 +166,7 @@ def parquets_to_csv_streaming(parquet_paths: list[str],
         for start in range(0, n, WRITE_CHUNK):
             chunk = df.slice(start, WRITE_CHUNK)
             # has_header=False sau lần đầu → không lặp lại header
-            csv_bytes = chunk.write_csv(has_header=not header_written).encode('utf-8')
+            csv_bytes = chunk.write_csv().encode('utf-8')
             # Bỏ BOM ký tự đầu nếu polars tự thêm
             if csv_bytes.startswith(b'\xef\xbb\xbf'):
                 csv_bytes = csv_bytes[3:]
