@@ -2,49 +2,104 @@ import streamlit as st
 import pandas as pd
 import polars as pl
 import os
+from pathlib import Path
+import tempfile
 
 st.set_page_config(page_title="Excel Column Keeper", layout="wide")
 
 st.title("📊 Excel Column Keeper System")
 
 # ======================
-# INPUT PATH
+# INPUT MODE
 # ======================
 
-input_path = st.text_input("📂 Input Excel Path")
+mode = st.radio(
+    "Chọn cách nhập file",
+    ["Upload file (khuyến nghị)", "Nhập đường dẫn file"]
+)
+
+input_path = None
+uploaded_file = None
+
+# ======================
+# MODE 1 — UPLOAD
+# ======================
+
+if mode == "Upload file (khuyến nghị)":
+
+    uploaded_file = st.file_uploader(
+        "📂 Chọn file Excel",
+        type=["xlsx", "xls"]
+    )
+
+    if uploaded_file is not None:
+
+        # lưu file tạm
+        temp_dir = tempfile.gettempdir()
+        input_path = os.path.join(temp_dir, uploaded_file.name)
+
+        with open(input_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+
+        st.success(f"✅ File đã upload: {uploaded_file.name}")
+
+
+# ======================
+# MODE 2 — PATH
+# ======================
+
+if mode == "Nhập đường dẫn file":
+
+    raw_path = st.text_input("📂 Input Excel Path")
+
+    if raw_path:
+        raw_path = raw_path.strip().strip('"')
+
+        file_path = Path(raw_path)
+
+        if file_path.is_file():
+            input_path = str(file_path)
+            st.success("✅ Tìm thấy file")
+        else:
+            st.error("❌ File input không tồn tại")
+            st.stop()
+
+
+# ======================
+# OUTPUT PATH
+# ======================
+
 output_path = st.text_input("💾 Output Excel Path")
 
-selected_columns = []
+def validate_output_path(path):
+    if not path:
+        return False
+    folder = os.path.dirname(path)
+    if folder == "":
+        return False
+    return os.path.isdir(folder)
+
 
 # ======================
-# LOAD FILE + GET COLUMNS
+# LOAD COLUMNS
 # ======================
+
+selected_columns = []
+columns = []
 
 if input_path:
 
-    if not os.path.exists(input_path):
-        st.error("❌ File input không tồn tại")
-        st.stop()
-
     try:
-        # đọc preview để lấy header
         df_preview = pd.read_excel(input_path, nrows=5)
         columns = list(df_preview.columns)
 
-        st.success(f"✅ Đã đọc file — Tổng số cột: {len(columns)}")
-
-        # ======================
-        # OPTION SELECT
-        # ======================
-
-        st.subheader("Chọn phương án")
+        st.success(f"📑 Tổng số cột: {len(columns)}")
 
         option = st.radio(
             "Phương án chọn cột",
             ["Nhập danh sách tên cột", "Chọn cột trực tiếp"]
         )
 
-        # OPTION 1
         if option == "Nhập danh sách tên cột":
 
             col_text = st.text_area(
@@ -53,10 +108,11 @@ if input_path:
             )
 
             if col_text:
-                selected_columns = [c.strip() for c in col_text.split(",") if c.strip()]
+                selected_columns = [
+                    c.strip() for c in col_text.split(",") if c.strip()
+                ]
 
-        # OPTION 2
-        if option == "Chọn cột trực tiếp":
+        else:
 
             selected_columns = st.multiselect(
                 "Chọn cột muốn giữ",
@@ -71,17 +127,6 @@ if input_path:
 
 
 # ======================
-# VALIDATION OUTPUT PATH
-# ======================
-
-def validate_output_path(path):
-    folder = os.path.dirname(path)
-    if folder == "":
-        return False
-    return os.path.isdir(folder)
-
-
-# ======================
 # EXECUTE BUTTON
 # ======================
 
@@ -92,7 +137,6 @@ run_button = st.button(
 
 if run_button:
 
-    # kiểm tra output folder
     if not validate_output_path(output_path):
         st.error("❌ Thư mục output không tồn tại")
         st.stop()
@@ -100,20 +144,18 @@ if run_button:
     try:
         with st.spinner("⏳ Đang xử lý dữ liệu..."):
 
-            # đọc bằng polars (nhanh hơn pandas)
             df = pl.read_excel(input_path)
 
-            # kiểm tra cột tồn tại
-            missing_cols = [c for c in selected_columns if c not in df.columns]
+            missing_cols = [
+                c for c in selected_columns if c not in df.columns
+            ]
 
             if missing_cols:
-                st.error(f"❌ Các cột không tồn tại: {missing_cols}")
+                st.error(f"❌ Cột không tồn tại: {missing_cols}")
                 st.stop()
 
-            # select cột
             df_selected = df.select(selected_columns)
 
-            # ghi file excel
             df_selected.write_excel(output_path)
 
         st.success("✅ Hoàn thành!")
