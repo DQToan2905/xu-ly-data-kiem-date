@@ -25,13 +25,21 @@ selected_columns = []
 columns = []
 
 # ======================
-# LOAD COLUMNS
+# LOAD COLUMNS (ALL TEXT)
 # ======================
 
 if uploaded_file:
 
     try:
-        df_preview = pd.read_excel(uploaded_file, nrows=5)
+        uploaded_file.seek(0)
+
+        # đọc preview — tất cả text
+        df_preview = pd.read_excel(
+            uploaded_file,
+            nrows=5,
+            dtype=str
+        )
+
         columns = list(df_preview.columns)
 
         st.success(f"📑 Tổng số cột: {len(columns)}")
@@ -81,9 +89,13 @@ if run_button:
     try:
         with st.spinner("⏳ Đang xử lý dữ liệu..."):
 
-            # đọc lại từ đầu
             uploaded_file.seek(0)
+
+            # đọc full dữ liệu
             df = pl.read_excel(uploaded_file)
+
+            # ép tất cả thành TEXT
+            df = df.with_columns(pl.all().cast(pl.Utf8))
 
             missing_cols = [
                 c for c in selected_columns if c not in df.columns
@@ -95,7 +107,6 @@ if run_button:
 
             df_selected = df.select(selected_columns)
 
-            # ghi ra buffer
             buffer = io.BytesIO()
             df_selected.write_excel(buffer)
 
@@ -103,7 +114,6 @@ if run_button:
 
         st.success("✅ Hoàn thành!")
 
-        # nút download
         st.download_button(
             label="📥 Tải file kết quả",
             data=buffer,
