@@ -1,96 +1,37 @@
 import streamlit as st
 import pandas as pd
 import polars as pl
-import os
-from pathlib import Path
-import tempfile
+import io
 
 st.set_page_config(page_title="Excel Column Keeper", layout="wide")
 
 st.title("📊 Excel Column Keeper System")
 
 # ======================
-# INPUT MODE
+# UPLOAD FILE
 # ======================
 
-mode = st.radio(
-    "Chọn cách nhập file",
-    ["Upload file (khuyến nghị)", "Nhập đường dẫn file"]
+uploaded_file = st.file_uploader(
+    "📂 Upload file Excel",
+    type=["xlsx", "xls"]
 )
 
-input_path = None
-uploaded_file = None
+output_name = st.text_input(
+    "💾 Tên file kết quả",
+    placeholder="ket_qua.xlsx"
+)
 
-# ======================
-# MODE 1 — UPLOAD
-# ======================
-
-if mode == "Upload file (khuyến nghị)":
-
-    uploaded_file = st.file_uploader(
-        "📂 Chọn file Excel",
-        type=["xlsx", "xls"]
-    )
-
-    if uploaded_file is not None:
-
-        # lưu file tạm
-        temp_dir = tempfile.gettempdir()
-        input_path = os.path.join(temp_dir, uploaded_file.name)
-
-        with open(input_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-
-        st.success(f"✅ File đã upload: {uploaded_file.name}")
-
-
-# ======================
-# MODE 2 — PATH
-# ======================
-
-if mode == "Nhập đường dẫn file":
-
-    raw_path = st.text_input("📂 Input Excel Path")
-
-    if raw_path:
-        raw_path = raw_path.strip().strip('"')
-
-        file_path = Path(raw_path)
-
-        if file_path.is_file():
-            input_path = str(file_path)
-            st.success("✅ Tìm thấy file")
-        else:
-            st.error("❌ File input không tồn tại")
-            st.stop()
-
-
-# ======================
-# OUTPUT PATH
-# ======================
-
-output_path = st.text_input("💾 Output Excel Path")
-
-def validate_output_path(path):
-    if not path:
-        return False
-    folder = os.path.dirname(path)
-    if folder == "":
-        return False
-    return os.path.isdir(folder)
-
+selected_columns = []
+columns = []
 
 # ======================
 # LOAD COLUMNS
 # ======================
 
-selected_columns = []
-columns = []
-
-if input_path:
+if uploaded_file:
 
     try:
-        df_preview = pd.read_excel(input_path, nrows=5)
+        df_preview = pd.read_excel(uploaded_file, nrows=5)
         columns = list(df_preview.columns)
 
         st.success(f"📑 Tổng số cột: {len(columns)}")
@@ -127,24 +68,22 @@ if input_path:
 
 
 # ======================
-# EXECUTE BUTTON
+# EXECUTE
 # ======================
 
 run_button = st.button(
-    "🚀 Xử lý và lưu file",
-    disabled=not (input_path and output_path and selected_columns)
+    "🚀 Xử lý",
+    disabled=not (uploaded_file and output_name and selected_columns)
 )
 
 if run_button:
 
-    if not validate_output_path(output_path):
-        st.error("❌ Thư mục output không tồn tại")
-        st.stop()
-
     try:
         with st.spinner("⏳ Đang xử lý dữ liệu..."):
 
-            df = pl.read_excel(input_path)
+            # đọc lại từ đầu
+            uploaded_file.seek(0)
+            df = pl.read_excel(uploaded_file)
 
             missing_cols = [
                 c for c in selected_columns if c not in df.columns
@@ -156,10 +95,21 @@ if run_button:
 
             df_selected = df.select(selected_columns)
 
-            df_selected.write_excel(output_path)
+            # ghi ra buffer
+            buffer = io.BytesIO()
+            df_selected.write_excel(buffer)
+
+            buffer.seek(0)
 
         st.success("✅ Hoàn thành!")
-        st.write(f"📁 File đã lưu tại: {output_path}")
+
+        # nút download
+        st.download_button(
+            label="📥 Tải file kết quả",
+            data=buffer,
+            file_name=output_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
     except Exception as e:
         st.error(f"❌ Lỗi xử lý: {e}")
